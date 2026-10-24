@@ -1,462 +1,375 @@
 # Deployment Plan: Google Workspace MCP Server on Railway
 
-This document describes how to deploy the Generic Google Workspace MCP Server to [Railway](https://railway.app). It covers prerequisites, configuration, OAuth/token strategy, deployment steps, client wiring, and a pre/post-deploy checklist.
+How to deploy this server to [Railway](https://railway.app) from your own GitHub repo, with Google login supplied by an environment variable instead of a `tokens.json` file.
 
-Related docs: [architecture.md](./architecture.md) · [problemStatement.md](./problemStatement.md)
+Related docs: [README.md](../README.md) · [architecture.md](./architecture.md)
 
----
-
-## 1. Deployment Overview
-
-### Local vs Railway
-
-| Aspect | Local (current) | Railway (target) |
-|--------|-----------------|------------------|
-| Transport | `stdio` | `streamable-http` |
-| Bind address | `127.0.0.1` | `0.0.0.0` |
-| Port | Fixed (`3000`) | Railway-assigned (`PORT`) |
-| TLS | Not required | Provided by Railway |
-| Token storage | `./tokens.json` | Persistent **Volume** |
-| MCP clients | Cursor / Claude Desktop (stdio) | Remote HTTP MCP clients |
-
-### Target architecture on Railway
-
-```text
-MCP Client (remote)
-        |
-        | HTTPS (Streamable HTTP)
-        v
-Railway Edge (TLS termination)
-        |
-        v
-google-workspace-mcp-server container
-  - MCP HTTP handler
-  - Gmail / Docs services
-  - FileTokenStore → mounted Volume
-        |
-        v
-Google APIs (Gmail, Docs)
-```
-
-Railway is suitable for a **remote, always-on MCP server**. Local IDE clients that only support stdio (e.g. Cursor) will still use the local setup; remote agents or HTTP-capable MCP clients connect to the Railway URL.
+> **Read §4 before you generate a public domain.** The HTTP transport requires a shared bearer token on every endpoint except `/health`.
 
 ---
 
-## 2. Prerequisites
+## 0. What's already in the repo
 
-Before deploying, ensure you have:
+These parts are already done. You don't need to change any code to deploy.
 
-- [ ] A Railway account and project
-- [ ] This repository pushed to GitHub (or another Railway-supported source)
-- [ ] A Google Cloud project with **Gmail API** and **Google Docs API** enabled
-- [ ] OAuth 2.0 credentials configured for **production** (see §4)
-- [ ] A working local setup (server verified with `npx tsx scripts/verify-server.ts`)
-- [ ] Node.js **20+** in the container (Dockerfile uses Node 22)
-
----
-
-## 3. Required Code & Config Adjustments
-
-The server already supports HTTP transport. No code changes are strictly required for a first deployment, but the following **environment configuration is mandatory**.
-
-### 3.1 Transport and networking
-
-Railway injects a dynamic `PORT` and expects the process to listen on `0.0.0.0`.
-
-| Variable | Local value | Railway value |
-|----------|-------------|---------------|
-| `MCP_TRANSPORT` | `stdio` | `streamable-http` |
-| `MCP_HOST` | `127.0.0.1` | `0.0.0.0` |
-| `MCP_PORT` | `3000` | `${PORT}` (Railway reference) |
-
-In the Railway dashboard, set:
-
-```dotenv
-MCP_TRANSPORT=streamable-http
-MCP_HOST=0.0.0.0
-MCP_PORT=${{PORT}}
-```
-
-> **Note:** The app reads `MCP_PORT`, not `PORT` directly. Mapping `${{PORT}}` → `MCP_PORT` is required until the config layer is updated to fall back to `process.env.PORT`.
-
-### 3.2 Token store path (Volume)
-
-Railway containers have an **ephemeral filesystem**. Tokens written to `./tokens.json` inside the container are **lost on redeploy**.
-
-Mount a Railway Volume and point the token store at it:
-
-```dotenv
-GOOGLE_TOKEN_STORE_PATH=/data/tokens.json
-```
-
-The Dockerfile already documents `/app/data`; align the Volume mount path with this variable.
-
-### 3.3 Recommended follow-up code improvements (post-V1)
-
-These are not blockers but should be tracked:
-
-| Improvement | Why |
-|-------------|-----|
-| Auto-read `process.env.PORT` when `MCP_PORT` is unset | Native Railway compatibility |
-| `GET /health` endpoint | Railway health checks & uptime monitoring |
-| Env-based `TokenStore` (JSON in a single secret var) | Simpler than Volume for single-account V1 |
-| Production OAuth callback route on the server | Re-auth without local `npm run auth` |
+| Item | Where | Status |
+|------|-------|--------|
+| Dockerfile build (Node 22, `node dist/index.js`) | `Dockerfile` | Done |
+| Railway config: Dockerfile builder, health check on `/health` | `railway.toml` | Done |
+| Reads Railway's `PORT`, switches to HTTP, binds to `0.0.0.0` | `src/config/env.ts` | Done |
+| `GET /health` endpoint | `src/http/routes.ts` | Done |
+| Token store that reads from an env var (`GOOGLE_TOKENS_JSON`) | `src/auth/tokenStore/envTokenStore.ts` | Done |
+| Helper that prints `tokens.json` as a single line | `npm run tokens:env` | Done |
+| Remote smoke test | `scripts/verify-server.ts` | Done |
+| Authentication on the HTTP endpoints | `src/http/auth.ts` | Done |
 
 ---
 
-## 4. Google Cloud OAuth (Production)
+## 1. Transport, port, host, and health check
 
-### 4.1 Credential type
+### Transport: `streamable-http`
 
-For Railway, use a **Web application** OAuth client (not Desktop), because:
+Railway runs the container as a network service, so it can't use `stdio`. Use `streamable-http`.
 
-- Redirect URIs must match your public Railway URL
-- The callback server runs on a public HTTPS endpoint
+### Port and host: Railway's `PORT` on `0.0.0.0`
 
-### 4.2 Redirect URI
+Railway injects a `PORT` variable and sends traffic to that port on all interfaces. The config layer (`src/config/env.ts`) handles this already. **Whenever `PORT` is set**, it:
 
-After Railway assigns a public domain (e.g. `https://google-workspace-mcp-production.up.railway.app`), register this redirect URI in Google Cloud Console → **APIs & Services → Credentials → OAuth 2.0 Client → Authorized redirect URIs**:
+- forces the transport to `streamable-http`
+- binds to host `0.0.0.0`
+- listens on `PORT`
 
-```text
-https://<your-railway-domain>/oauth/callback
+When `PORT` is present, the server **ignores** `MCP_TRANSPORT`, `MCP_HOST`, and `MCP_PORT`. That means:
+
+- **Don't** set `PORT` yourself. Let Railway inject it.
+- **Don't** set `MCP_PORT=${{PORT}}`. It has no effect and only causes confusion.
+- Setting `MCP_TRANSPORT=streamable-http` is optional. It's harmless and documents your intent. The Dockerfile already sets it, along with `MCP_HOST=0.0.0.0`.
+
+### Endpoints on the deployed server
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `GET` | `/health` | Returns `{"status":"ok"}`. Railway's health check uses this (`railway.toml` → `healthcheckPath = "/health"`). |
+| `GET` | `/` | Returns service info as JSON. |
+| `POST` | `/` | The MCP Streamable HTTP endpoint. Point MCP clients at the base URL. |
+| `GET` | `/oauth/start`, `/oauth/callback` | Browser-based Google login. **Not recommended on Railway** (see §2.5 and §4). |
+
+After a deploy, the startup logs should include:
+
+```json
+{"level":"info","message":"MCP server configuration loaded","transport":"streamable-http","host":"0.0.0.0","port":8080,"tokenStore":"env",...}
 ```
 
-Update Railway env:
-
-```dotenv
-GOOGLE_REDIRECT_URI=https://<your-railway-domain>/oauth/callback
-```
-
-> The current server does **not** expose `/oauth/callback` in HTTP mode. For the first deployment, use the **token seeding** approach in §6.2 rather than in-container OAuth.
-
-### 4.3 Scopes (unchanged)
-
-| Scope | Purpose |
-|-------|---------|
-| `https://www.googleapis.com/auth/gmail.compose` | Draft + send |
-| `https://www.googleapis.com/auth/documents` | Append to Docs |
-
-### 4.4 OAuth consent screen
-
-- Set app name, support email, and developer contact
-- Add test users if the app is in **Testing** mode
-- Publish to **Production** when ready for non-test users
+`tokenStore: "env"` confirms that `GOOGLE_TOKENS_JSON` was picked up. If it says `"file"`, the variable is missing or empty.
 
 ---
 
-## 5. Railway Environment Variables
+## 2. Getting the Google login onto Railway without `tokens.json`
 
-Set these in **Railway → Service → Variables**:
+### 2.1 How it works
 
-### Required
+At startup, `createTokenStore()` checks for `GOOGLE_TOKENS_JSON`. If it's set, the server uses `EnvTokenStore`, which reads tokens from that variable and never touches the disk. If it isn't set, the server falls back to the file at `GOOGLE_TOKEN_STORE_PATH`.
 
-| Variable | Example | Notes |
-|----------|---------|-------|
-| `GOOGLE_CLIENT_ID` | `696759...apps.googleusercontent.com` | From Google Cloud |
-| `GOOGLE_CLIENT_SECRET` | `GOCSPX-...` | Mark as secret |
-| `GOOGLE_REDIRECT_URI` | `https://your-app.up.railway.app/oauth/callback` | Must match Google Console |
-| `GOOGLE_TOKEN_STORE_PATH` | `/data/tokens.json` | Must be on a Volume |
-| `MCP_TRANSPORT` | `streamable-http` | Required for Railway |
-| `MCP_HOST` | `0.0.0.0` | Bind all interfaces |
-| `MCP_PORT` | `${{PORT}}` | Railway dynamic port |
+Railway's filesystem is wiped on every redeploy, so on Railway you should use the env var.
 
-### Optional
+### 2.2 Exact value format
 
-| Variable | Default | Notes |
-|----------|---------|-------|
-| `LOG_LEVEL` | `info` | Use `warn` in production |
-| `MAX_EMAIL_BODY_BYTES` | `1048576` | Adjust if needed |
-| `MAX_DOC_APPEND_BYTES` | `1048576` | Adjust if needed |
-| `NODE_ENV` | — | Set to `production` |
+The value must be **valid JSON on a single line**, in one of these two shapes.
 
-**Do not** commit `.env`, `credential.json`, or `tokens.json` to git.
+**Shape A (recommended).** This is the exact contents of `tokens.json`, because the local auth flow writes tokens under the `default` key:
 
----
-
-## 6. Token Strategy on Railway
-
-### 6.1 Problem
-
-OAuth tokens must persist across deploys. Railway's default filesystem does not.
-
-### 6.2 Recommended approach: Volume + local auth seed
-
-**Phase 1 — Generate tokens locally (already done):**
-
-```bash
-npm run auth -- --callback-server
-# produces ./tokens.json
+```json
+{"default":{"accessToken":"ya29....","refreshToken":"1//0g....","expiryDate":1761400000000}}
 ```
 
-**Phase 2 — Mount a Railway Volume:**
+**Shape B.** A bare token object. The server automatically treats it as `default`:
 
-1. Railway → Service → **Volumes** → Add Volume
-2. Mount path: `/data`
-3. Set `GOOGLE_TOKEN_STORE_PATH=/data/tokens.json`
+```json
+{"accessToken":"ya29....","refreshToken":"1//0g....","expiryDate":1761400000000}
+```
 
-**Phase 3 — Seed tokens into the Volume (one-time):**
+Field rules:
 
-Option A — Railway CLI:
+| Field | Type | Notes |
+|-------|------|-------|
+| `accessToken` | string | It can be expired. The server refreshes it automatically. |
+| `refreshToken` | string | **The one that matters.** It must be present, or the server can't stay logged in. |
+| `expiryDate` | **number** | Unix time in **milliseconds**, not a string and not seconds. |
+
+Formatting rules for the Railway variable:
+
+- Don't wrap the value in quotes. Paste the raw `{...}`.
+- Don't escape the inner quotes (`\"`).
+- Keep it on one line. Pretty-printed JSON with line breaks is the most common way to break this.
+- If the JSON is invalid, the server fails at startup with `Invalid GOOGLE_TOKENS_JSON: ...` in the deploy logs.
+
+### 2.3 Generate the tokens locally (one time)
+
+1. In your local `.env`, use the **same** `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` that you'll put on Railway. A refresh token only works with the OAuth client that issued it.
+2. Keep `GOOGLE_REDIRECT_URI=http://localhost:3000/oauth/callback` locally. Make sure that URI is registered on the OAuth client in Google Cloud Console.
+3. Run the local login:
+
+   ```bash
+   npm run auth -- --callback-server
+   ```
+
+   This writes `./tokens.json`, which is gitignored.
+
+### 2.4 Set the Railway variable
+
+Pick **one** of these options.
+
+**Option 1: Dashboard (simplest)**
+
+1. Run `npm run tokens:env` locally. It prints one line that starts with `GOOGLE_TOKENS_JSON=`.
+   - That line contains your refresh token. Copy it straight into Railway. Don't paste it into chats, tickets, or screenshots.
+2. In Railway, go to your service → **Variables** → **Raw Editor**, and paste the whole line.
+   - If you use **New Variable** instead: name it `GOOGLE_TOKENS_JSON` and paste only the `{...}` part as the value.
+3. Click **Deploy** to apply the staged change.
+
+**Option 2: Railway CLI (the token never appears on screen)**
 
 ```bash
 railway login
-railway link
-# Copy tokens.json into the running container's volume
-railway run -- sh -c 'cat > /data/tokens.json' < tokens.json
+railway link            # pick your project and service
+railway variables --set "GOOGLE_TOKENS_JSON=$(node -e 'process.stdout.write(JSON.stringify(require(\"./tokens.json\")))')"
 ```
 
-Option B — One-off deploy script / init container that writes tokens from a Railway secret (future improvement).
+The shell builds the minified JSON and passes it straight to Railway. If your CLI version uses a different subcommand, check `railway variables --help`.
 
-**Phase 4 — Verify token refresh:**
+### 2.5 Things to know
 
-The server auto-refreshes access tokens using the stored refresh token. After deploy, invoke `gmail_create_draft` and confirm success. If refresh fails, re-seed tokens.
-
-### 6.3 Token rotation
-
-If tokens are compromised:
-
-1. Revoke access in [Google Account permissions](https://myaccount.google.com/permissions)
-2. Re-run local `npm run auth`
-3. Re-seed `/data/tokens.json` on the Volume
+- **Refreshed access tokens live in memory only.** After each restart, the server refreshes again using the stored refresh token. This is expected.
+- **The refresh token is long-lived but can be revoked.** If you revoke access, change your Google password, or the app is in **Testing** mode, it can stop working. Google expires refresh tokens for apps in Testing after **7 days**. For something always-on, publish the OAuth consent screen to **Production** (or use an **Internal** app on Google Workspace).
+- **To rotate:** revoke access at [myaccount.google.com/permissions](https://myaccount.google.com/permissions), run `npm run auth -- --callback-server` again locally, and replace `GOOGLE_TOKENS_JSON` in Railway.
+- **Don't use `/oauth/start` on Railway.** With the env token store, a browser login through `/oauth/callback` saves tokens **only in memory**, so they're lost on the next restart. Both OAuth routes require the bearer token (see §4).
 
 ---
 
-## 7. Deployment Steps
+## 3. Railway variables
 
-### Phase 1: Prepare repository
+Set these under your service → **Variables**.
 
-- [ ] Ensure `Dockerfile` is present at repo root
-- [ ] Confirm `.gitignore` excludes `.env`, `tokens.json`, `credential.json`
-- [ ] Push latest code to GitHub
+### Required
 
-### Phase 2: Create Railway service
+| Variable | Value | Notes |
+|----------|-------|-------|
+| `GOOGLE_CLIENT_ID` | `xxxx.apps.googleusercontent.com` | Must be the same client that issued your refresh token. |
+| `GOOGLE_CLIENT_SECRET` | `GOCSPX-...` | Secret. |
+| `GOOGLE_REDIRECT_URI` | `https://<your-app>.up.railway.app/oauth/callback` | Required at startup even though refresh doesn't use it. If you ever use `/oauth/start`, add this exact URI to the OAuth client's **Authorized redirect URIs**. That requires a **Web application** client. Otherwise you can reuse your localhost URI; it only needs to be non-empty. |
+| `GOOGLE_TOKENS_JSON` | `{"default":{...}}` | Secret. See §2. |
 
-1. Log in to [Railway](https://railway.app)
-2. **New Project** → **Deploy from GitHub repo**
-3. Select this repository
-4. Railway detects the `Dockerfile` automatically
+### Recommended
 
-### Phase 3: Configure service
+| Variable | Value | Notes |
+|----------|-------|-------|
+| `LOG_LEVEL` | `info` | Never use `debug` in production. |
+| `MCP_TRANSPORT` | `streamable-http` | Optional. It's already forced when `PORT` is set and already set in the Dockerfile. |
 
-- [ ] Add all environment variables from §5
-- [ ] Add a **Volume** mounted at `/data`
-- [ ] Set **Start Command** (optional — Dockerfile `CMD` is sufficient):
+### Required for HTTP transport
 
-  ```bash
-  node dist/index.js
-  ```
+| Variable | Value | Notes |
+|----------|-------|-------|
+| `MCP_AUTH_TOKEN` | A long random string, for example from `openssl rand -hex 32` | Secret. This is the shared secret clients must send. |
 
-- [ ] Generate a public domain: **Settings → Networking → Generate Domain**
+### Don't set
 
-### Phase 4: Seed tokens
+| Variable | Why |
+|----------|-----|
+| `PORT` | Railway injects it. |
+| `MCP_PORT`, `MCP_HOST` | Ignored when `PORT` is set. |
+| `GOOGLE_TOKEN_STORE_PATH` | Not used when `GOOGLE_TOKENS_JSON` is set. The Dockerfile default (`/data/tokens.json`) is harmless. |
+| `NODE_ENV` | The Dockerfile already sets `production`, so `.env` isn't loaded in the container. |
 
-- [ ] Copy local `tokens.json` to the Volume (§6.2)
-- [ ] Confirm file permissions (container user can read/write `/data/tokens.json`)
-
-### Phase 5: Deploy
-
-- [ ] Trigger deploy (automatic on push, or manual **Deploy**)
-- [ ] Watch **Deploy Logs** for:
-
-  ```json
-  {"level":"info","message":"Starting MCP server","transport":"streamable-http",...}
-  ```
-
-- [ ] Confirm no startup errors about missing env vars
-
-### Phase 6: Smoke test
-
-From your local machine (with MCP client or curl):
-
-```bash
-# Replace with your Railway domain
-export MCP_URL=https://your-app.up.railway.app
-
-# List tools via MCP client (recommended)
-npx tsx scripts/verify-server.ts   # adapt for HTTP — see §8
-```
-
-Minimum checks:
-
-- [ ] Server responds on HTTPS
-- [ ] MCP `tools/list` returns 3 tools
-- [ ] `gmail_create_draft` succeeds (confirms OAuth + Volume)
-- [ ] Logs show no token or body content leakage
+You don't need a Railway Volume with this approach.
 
 ---
 
-## 8. Connecting MCP Clients to Railway
+## 4. Authentication on the HTTP transport
 
-### 8.1 HTTP-capable MCP clients
+### Current state: shared-secret authentication is enabled
 
-Point the client at your Railway URL using **Streamable HTTP** transport:
+The HTTP server requires `Authorization: Bearer <MCP_AUTH_TOKEN>` before routing every request except `/health`. This includes `/`, MCP requests, `/oauth/start`, and `/oauth/callback`.
+
+Tokens are compared with `crypto.timingSafeEqual`. If `MCP_AUTH_TOKEN` is missing in HTTP mode, configuration fails and the server refuses to start.
+
+Add `MCP_AUTH_TOKEN`, using a random string of at least 32 bytes, as a Railway secret. Configure your MCP client to send it:
+
+   ```json
+   {
+     "mcpServers": {
+       "google-workspace-remote": {
+         "url": "https://<your-app>.up.railway.app",
+         "headers": { "Authorization": "Bearer <MCP_AUTH_TOKEN>" }
+       }
+     }
+   }
+   ```
+
+Stronger options for later include OAuth 2.1 per the MCP authorization spec, or keeping the service on Railway private networking only. For a single-user server, a shared secret is enough.
+
+---
+
+## 5. Push to your own GitHub repo
+
+The clone currently points at someone else's repo:
 
 ```text
-https://<your-railway-domain>
+origin  https://github.com/saksham20189575/mcp-server-4
 ```
 
-Consult your MCP client's remote-server configuration docs for the exact JSON shape. The server uses the MCP SDK's `createMcpHandler` over HTTP.
+The branch is `main`. The history contains no `.env`, `tokens.json`, or `credential.json`, and all three are in `.gitignore`.
 
-### 8.2 Cursor / stdio-only clients
+### Steps
 
-Cursor's default MCP config spawns a **local stdio process**. It does **not** connect to a remote Railway URL out of the box.
+1. **Create an empty private repo** on GitHub, for example `<you>/google-workspace-mcp`. Don't add a README, `.gitignore`, or license, so the first push doesn't conflict.
+2. **Point the remote at your repo.** Keep the original as `upstream` so you can still pull its updates:
 
-Options:
+   ```bash
+   git remote rename origin upstream
+   git remote add origin https://github.com/<you>/google-workspace-mcp.git
+   git remote -v
+   ```
 
-| Option | Description |
-|--------|-------------|
-| **Keep local stdio** | Use Railway for remote agents; keep Cursor on local `npm run dev` |
-| **HTTP proxy / bridge** | Run a local bridge that forwards stdio ↔ Railway HTTP (custom tooling) |
-| **Future Cursor remote MCP** | Adopt when/if your client adds native remote HTTP MCP support |
+   Or, with the GitHub CLI, after the rename:
 
-### 8.3 Example remote client env
+   ```bash
+   gh repo create <you>/google-workspace-mcp --private --source=. --remote=origin
+   ```
 
-```json
-{
-  "mcpServers": {
-    "google-workspace-remote": {
-      "url": "https://your-app.up.railway.app",
-      "transport": "streamable-http"
-    }
-  }
-}
+3. **Check that no secrets are staged**, then commit any pending changes (for example the modified `package-lock.json`):
+
+   ```bash
+   git status
+   git ls-files | grep -E '(^|/)(\.env|tokens\.json|credential\.json)$'   # should print nothing
+   git add package-lock.json
+   git commit -m "Update lockfile"
+   ```
+
+4. **Push:**
+
+   ```bash
+   git push -u origin main
+   ```
+
+5. **In Railway:** **New Project** → **Deploy from GitHub repo** → pick **your** repo. If prompted, install the Railway GitHub app with access to that repo. Railway detects `railway.toml` and the `Dockerfile` automatically.
+6. Add the variables from §3, then deploy.
+7. **Settings → Networking → Generate Domain** to get `https://<your-app>.up.railway.app`. Do this only after reading §4.
+
+After this, every push to `main` on your repo triggers a redeploy.
+
+---
+
+## 6. Testing the deployed URL
+
+Set the URL once in your local shell:
+
+```bash
+export MCP_URL=https://<your-app>.up.railway.app
 ```
 
-Exact schema depends on the MCP client — adjust per client documentation.
+### 6.1 Health check
 
----
-
-## 9. Dockerfile & Build Notes
-
-The existing multi-stage `Dockerfile`:
-
-- Builds TypeScript in a builder stage
-- Runs production deps only in runtime stage
-- Uses Node 22 Alpine
-- Expects tokens on a mounted volume
-
-Railway build settings:
-
-| Setting | Value |
-|---------|-------|
-| Builder | Dockerfile |
-| Root directory | `/` (repo root) |
-| Watch paths | `src/**`, `Dockerfile`, `package.json` |
-
-No `railway.toml` is required for a basic deploy, but you may add one later for reproducible config.
-
----
-
-## 10. Security Checklist
-
-- [ ] All secrets (`GOOGLE_CLIENT_SECRET`, tokens) stored in Railway Variables or Volume — never in git
-- [ ] Railway service is **not** publicly advertised unless intended
-- [ ] Consider Railway **private networking** or access controls if available on your plan
-- [ ] OAuth scopes remain least-privilege (`gmail.compose`, `documents`)
-- [ ] `LOG_LEVEL=warn` or `info` in production; never `debug` with sensitive traffic
-- [ ] Review who can trigger `gmail_send_email` (side-effecting tool)
-- [ ] Rotate credentials if `credential.json` or `tokens.json` were ever committed
-- [ ] Enable Google OAuth **Publishing** review before broad user access
-
----
-
-## 11. Monitoring & Operations
-
-### Logs
-
-Railway captures stdout/stderr. The server emits structured JSON logs:
-
-```json
-{
-  "level": "info",
-  "requestId": "req_...",
-  "toolName": "gmail_send_email",
-  "recipientCount": 2,
-  "durationMs": 481,
-  "resultStatus": "success"
-}
+```bash
+curl -i "$MCP_URL/health"
+# HTTP/2 200 ... {"status":"ok"}
 ```
 
-Use Railway **Observability → Logs** to filter by `toolName`, `errorCode`, or `resultStatus`.
+Railway's dashboard should also show the deployment as **Healthy**, because it uses the same path.
 
-### Deploy triggers
+### 6.2 MCP handshake with curl (optional)
 
-| Event | Action |
-|-------|--------|
-| Push to `main` | Auto-redeploy (if configured) |
-| Env var change | Redeploy required |
-| Volume data | Persists across redeploys |
-| Token expiry / revoke | Re-seed `tokens.json` on Volume |
+```bash
+curl -s -X POST "$MCP_URL/" \
+  -H "Authorization: Bearer $MCP_AUTH_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"curl","version":"0"}}}'
+```
 
-### Rollback
+You should get back an `initialize` result with `serverInfo.name = "google-workspace-mcp-server"`. Without the authorization header you should get `401`.
 
-Railway → **Deployments** → select previous successful deployment → **Rollback**.
+### 6.3 Full check with `scripts/verify-server.ts`
 
----
+When `MCP_URL` is set, the script runs against the remote server instead of starting a local one. It:
 
-## 12. Troubleshooting
+1. calls `GET $MCP_URL/health` and expects `{"status":"ok"}`
+2. connects over Streamable HTTP and lists tools, expecting exactly `gmail_create_draft`, `gmail_send_email`, and `google_docs_append_content`
+3. calls `gmail_create_draft` with a bad email address and expects an `INVALID_INPUT` error
+4. **creates a real Gmail draft** in the account behind `GOOGLE_TOKENS_JSON`. It doesn't send anything. This step confirms that the Google login works on Railway.
+
+Before running it, note two things:
+
+- The draft's recipient defaults to a hardcoded address (`sarora12@gmail.com`). **Set `TEST_EMAIL_TO` to your own address.**
+- The script loads your local `.env` through dotenv. Any `MCP_URL` or `TEST_EMAIL_TO` set in your shell takes precedence.
+
+Run it:
+
+```bash
+npm install          # the script needs devDependencies (tsx, @modelcontextprotocol/client)
+MCP_URL=https://<your-app>.up.railway.app \
+TEST_EMAIL_TO=you@example.com \
+npx tsx scripts/verify-server.ts
+```
+
+Expected output:
+
+```text
+✓ Health endpoint responds
+Using HTTP transport: https://<your-app>.up.railway.app
+Connecting to MCP server...
+✓ Connected
+Discovered tools:
+  - gmail_create_draft
+  - gmail_send_email
+  - google_docs_append_content
+✓ All 3 expected tools discovered
+✓ Validation error handling works
+✓ Gmail draft created (draftId: ..., status: ...)
+✅ MCP server verification passed
+```
+
+Then open Gmail → **Drafts**, confirm the `[MCP Verify] ...` draft is there, and delete it.
+
+Set `MCP_AUTH_TOKEN` locally before running the script against an HTTP server. The script sends it as the `Authorization` header; the `/health` request remains unauthenticated.
+
+### 6.4 If a step fails
 
 | Symptom | Likely cause | Fix |
 |---------|--------------|-----|
-| Deploy crashes immediately | Missing env var | Check logs for `Missing required environment variable` |
-| `Connection refused` externally | `MCP_HOST=127.0.0.1` | Set `MCP_HOST=0.0.0.0` |
-| Port binding error | `MCP_PORT` ≠ Railway `PORT` | Set `MCP_PORT=${{PORT}}` |
-| `GOOGLE_AUTH_REQUIRED` | No tokens on Volume | Seed `/data/tokens.json` |
-| `GOOGLE_TOKEN_REFRESH_FAILED` | Revoked refresh token | Re-auth locally, re-seed Volume |
-| `redirect_uri_mismatch` | Google Console URI ≠ env | Align `GOOGLE_REDIRECT_URI` |
-| Tokens lost after redeploy | No Volume mounted | Add Volume at `/data` |
-| MCP client can't connect | Using stdio config for remote | Switch client to Streamable HTTP |
+| Deploy crashes with `Missing required environment variable: ...` | A required variable from §3 isn't set | Add it and redeploy |
+| Deploy crashes with `Invalid GOOGLE_TOKENS_JSON` | Not valid single-line JSON, wrapped in quotes, or escaped | Re-set it using §2.4 |
+| Logs show `"tokenStore":"file"` | `GOOGLE_TOKENS_JSON` is missing or empty | Set it, then redeploy |
+| Health check times out in Railway | App crashed at startup | Read the deploy logs; usually one of the two rows above |
+| Draft step fails with `GOOGLE_AUTH_REQUIRED` | No tokens loaded | See the `"tokenStore":"file"` row above |
+| Draft step fails with `GOOGLE_TOKEN_REFRESH_FAILED` | Refresh token revoked or expired (7-day limit in Testing), or `GOOGLE_CLIENT_ID`/`GOOGLE_CLIENT_SECRET` don't match the client that issued it | Log in again locally with the same client, then replace `GOOGLE_TOKENS_JSON` |
+| Draft step fails with `INSUFFICIENT_SCOPE` | The token was issued before the Gmail and Docs scopes were added | Log in again locally (`npm run auth -- --callback-server`) |
+| Draft step fails with a `403` from Google | The account isn't a test user on the consent screen | Add it under **OAuth consent screen → Test users** |
+| `ECONNREFUSED` or `404` from Railway's edge | No public domain, or the wrong URL | Generate a domain; use the base URL with no path |
 
 ---
 
-## 13. Deployment Checklist (Summary)
+## 7. Checklist
 
-### Pre-deploy
+**Before deploying**
 
-- [ ] Google Cloud OAuth configured for production
-- [ ] Railway project + GitHub repo linked
-- [ ] Local verification passed
-- [ ] `tokens.json` generated locally
+- [ ] My own GitHub repo is `origin`; the original is `upstream` (§5)
+- [ ] `git ls-files` shows no `.env`, `tokens.json`, or `credential.json`
+- [ ] Local login done using the same OAuth client as production (§2.3)
+- [ ] OAuth consent screen published to Production, or I accept the 7-day refresh limit
+- [ ] `MCP_AUTH_TOKEN` generated for shared-secret auth (§4)
 
-### Deploy
+**Railway**
 
-- [ ] Dockerfile build succeeds
-- [ ] All §5 env vars set
-- [ ] Volume mounted at `/data`
-- [ ] `MCP_TRANSPORT=streamable-http`, `MCP_HOST=0.0.0.0`, `MCP_PORT=${{PORT}}`
-- [ ] Public Railway domain generated
-- [ ] Tokens seeded to Volume
+- [ ] Service deployed from my repo; Dockerfile builder detected
+- [ ] `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REDIRECT_URI`, and `GOOGLE_TOKENS_JSON` set
+- [ ] `MCP_AUTH_TOKEN` set
+- [ ] `PORT`, `MCP_PORT`, and `MCP_HOST` not set manually
+- [ ] Logs show `transport: streamable-http`, `host: 0.0.0.0`, `tokenStore: env`
 
-### Post-deploy
+**After deploying**
 
-- [ ] MCP tool discovery works over HTTPS
-- [ ] Gmail draft test succeeds
-- [ ] Logs are clean (no secrets leaked)
-- [ ] Client configuration updated for remote URL
-- [ ] OAuth redirect URI registered in Google Console (for future in-app auth)
-
----
-
-## 14. Estimated Timeline
-
-| Phase | Effort |
-|-------|--------|
-| Google Cloud production OAuth setup | 30–60 min |
-| Railway service + env + Volume | 20–30 min |
-| Token seeding + smoke test | 15–30 min |
-| Client wiring + documentation | 15–30 min |
-| **Total (first deploy)** | **~1.5–2.5 hours** |
-
-Subsequent deploys (code-only changes) typically take 5–10 minutes with Volume-backed tokens persisting automatically.
-
----
-
-## 15. References
-
-- [Railway Docs — Deployments](https://docs.railway.app/deploy/deployments)
-- [Railway Docs — Volumes](https://docs.railway.app/reference/volumes)
-- [Railway Docs — Variables](https://docs.railway.app/guides/variables)
-- [MCP Streamable HTTP](https://modelcontextprotocol.io/specification/)
-- [Google OAuth 2.0](https://developers.google.com/identity/protocols/oauth2)
-- Project [README.md](../README.md)
-- Project [architecture.md](./architecture.md)
+- [ ] `curl $MCP_URL/health` returns `{"status":"ok"}`
+- [ ] `verify-server.ts` passes with `TEST_EMAIL_TO` set to my address
+- [ ] Test draft deleted from Gmail
+- [ ] Requests without the bearer token get `401`

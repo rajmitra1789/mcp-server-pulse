@@ -16,8 +16,19 @@ const EXPECTED_TOOLS = [
 async function createTransport() {
   const mcpUrl = process.env.MCP_URL?.trim();
   if (mcpUrl) {
+    const authToken = process.env.MCP_AUTH_TOKEN?.trim();
+    if (!authToken) {
+      throw new Error("MCP_AUTH_TOKEN is required when MCP_URL is set");
+    }
+
     console.log(`Using HTTP transport: ${mcpUrl}`);
-    return new StreamableHTTPClientTransport(new URL(mcpUrl));
+    return new StreamableHTTPClientTransport(new URL(mcpUrl), {
+      requestInit: {
+        headers: {
+          Authorization: `Bearer ${authToken}`,
+        },
+      },
+    });
   }
 
   const serverPath = resolve("dist/index.js");

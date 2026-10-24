@@ -24,6 +24,7 @@ export type Config = {
     transport: McpTransport;
     host: string;
     port: number;
+    authToken?: string;
   };
   logging: {
     level: "debug" | "info" | "warn" | "error";
@@ -118,6 +119,8 @@ function resolveHost(): string {
 export function loadConfig(): Config {
   const transport = resolveTransport();
   const tokensJson = optionalTokensJson();
+  const authToken =
+    transport === "streamable-http" ? requireEnv("MCP_AUTH_TOKEN") : undefined;
 
   return {
     google: {
@@ -131,6 +134,7 @@ export function loadConfig(): Config {
       transport,
       host: resolveHost(),
       port: resolveMcpPort(),
+      authToken,
     },
     logging: {
       level: parseLogLevel(optionalEnv("LOG_LEVEL", "info")),

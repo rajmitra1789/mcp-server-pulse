@@ -97,6 +97,7 @@ npm start
 | `MCP_TRANSPORT` | No | `stdio` | `stdio` or `streamable-http` |
 | `MCP_HOST` | No | `127.0.0.1` | HTTP transport host |
 | `MCP_PORT` | No | `3000` | HTTP transport port |
+| `MCP_AUTH_TOKEN` | HTTP only | — | Bearer token required by every HTTP endpoint except `/health` |
 | `LOG_LEVEL` | No | `info` | `debug`, `info`, `warn`, `error` |
 | `MAX_EMAIL_BODY_BYTES` | No | `1048576` | Max email body size |
 | `MAX_DOC_APPEND_BYTES` | No | `1048576` | Max doc append size |

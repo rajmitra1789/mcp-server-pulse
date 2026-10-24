@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { EnvTokenStore } from "../../src/auth/tokenStore/envTokenStore.js";
 import { createTokenStore } from "../../src/auth/credentialProvider.js";
+import { authorizeHttpRequest } from "../../src/http/auth.js";
 import { handleHealth, handleHttpRoute } from "../../src/http/routes.js";
 import type { Config } from "../../src/config/env.js";
 import { loadConfig } from "../../src/config/env.js";
@@ -24,6 +25,7 @@ describe("loadConfig", () => {
     process.env.GOOGLE_REDIRECT_URI = "http://localhost:3000/callback";
     process.env.MCP_TRANSPORT = "stdio";
     process.env.LOG_LEVEL = "info";
+    delete process.env.PORT;
 
     const config = loadConfig();
     expect(config.google.clientId).toBe("test-client-id");
@@ -40,6 +42,7 @@ describe("loadConfig", () => {
     process.env.GOOGLE_REDIRECT_URI = "http://localhost:3000/callback";
     delete process.env.MCP_PORT;
     process.env.PORT = "8080";
+    process.env.MCP_AUTH_TOKEN = "test-auth-token";
 
     const config = loadConfig();
     expect(config.mcp.port).toBe(8080);
@@ -54,6 +57,7 @@ describe("loadConfig", () => {
     process.env.GOOGLE_REDIRECT_URI = "http://localhost:3000/callback";
     process.env.MCP_PORT = "4000";
     process.env.PORT = "8080";
+    process.env.MCP_AUTH_TOKEN = "test-auth-token";
 
     const config = loadConfig();
     expect(config.mcp.port).toBe(8080);
@@ -69,6 +73,7 @@ describe("loadConfig", () => {
     process.env.MCP_TRANSPORT = "stdio";
     process.env.MCP_HOST = "127.0.0.1";
     process.env.PORT = "8080";
+    process.env.MCP_AUTH_TOKEN = "test-auth-token";
 
     const config = loadConfig();
     expect(config.mcp.transport).toBe("streamable-http");
@@ -87,11 +92,28 @@ describe("loadConfig", () => {
     delete process.env.MCP_HOST;
     delete process.env.MCP_PORT;
     process.env.PORT = "8080";
+    process.env.MCP_AUTH_TOKEN = "test-auth-token";
 
     const config = loadConfig();
     expect(config.mcp.transport).toBe("streamable-http");
     expect(config.mcp.host).toBe("0.0.0.0");
     expect(config.mcp.port).toBe(8080);
+
+    process.env = original;
+  });
+
+  it("requires MCP_AUTH_TOKEN for HTTP transport", () => {
+    const original = { ...process.env };
+    process.env.GOOGLE_CLIENT_ID = "test-client-id";
+    process.env.GOOGLE_CLIENT_SECRET = "test-client-secret";
+    process.env.GOOGLE_REDIRECT_URI = "http://localhost:3000/callback";
+    process.env.MCP_TRANSPORT = "streamable-http";
+    delete process.env.MCP_AUTH_TOKEN;
+    delete process.env.PORT;
+
+    expect(() => loadConfig()).toThrow(
+      "Missing required environment variable: MCP_AUTH_TOKEN",
+    );
 
     process.env = original;
   });
@@ -109,6 +131,41 @@ describe("loadConfig", () => {
 
     process.env = original;
   });
+});
+
+describe("HTTP authentication", () => {
+  const authToken = "correct-auth-token";
+
+  function authenticate(path: string, authorization?: string): Response | null {
+    const headers = authorization ? { Authorization: authorization } : undefined;
+    return authorizeHttpRequest(
+      new Request(`http://localhost:3000${path}`, { headers }),
+      authToken,
+    );
+  }
+
+  it("rejects a request without a token", () => {
+    expect(authenticate("/")?.status).toBe(401);
+  });
+
+  it("rejects a request with the wrong token", () => {
+    expect(authenticate("/", "Bearer incorrect-auth-tok")?.status).toBe(401);
+  });
+
+  it("allows a request with the right token", () => {
+    expect(authenticate("/", `Bearer ${authToken}`)).toBeNull();
+  });
+
+  it("allows /health without a token", () => {
+    expect(authenticate("/health")).toBeNull();
+  });
+
+  it.each(["/oauth/start", "/oauth/callback?code=test"])(
+    "protects %s",
+    (path) => {
+      expect(authenticate(path)?.status).toBe(401);
+    },
+  );
 });
 
 describe("EnvTokenStore", () => {

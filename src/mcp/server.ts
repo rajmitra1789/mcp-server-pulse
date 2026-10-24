@@ -3,6 +3,7 @@ import { serveStdio } from "@modelcontextprotocol/server/stdio";
 import { createServer as createHttpServer } from "node:http";
 import type { Config } from "../config/env.js";
 import { createCredentialProvider, createTokenStore } from "../auth/credentialProvider.js";
+import { authorizeHttpRequest } from "../http/auth.js";
 import { handleHttpRoute } from "../http/routes.js";
 import { Logger } from "../logging/logger.js";
 import { registerTools } from "./tools/registry.js";
@@ -35,6 +36,13 @@ export async function startStdioServer(config: Config): Promise<void> {
 }
 
 export async function startHttpServer(config: Config): Promise<void> {
+  const authToken = config.mcp.authToken;
+  if (!authToken) {
+    throw new Error(
+      "Missing required environment variable: MCP_AUTH_TOKEN",
+    );
+  }
+
   const logger = new Logger(config.logging.level);
   const { createMcpHandler } = await import("@modelcontextprotocol/server");
   const tokenStore = createTokenStore(config.google);
@@ -47,6 +55,22 @@ export async function startHttpServer(config: Config): Promise<void> {
       const port = config.mcp.port;
       const url = new URL(req.url ?? "/", `http://${host}:${port}`);
 
+      const headers = new Headers();
+      for (const [key, value] of Object.entries(req.headers)) {
+        if (value !== undefined) {
+          headers.set(key, Array.isArray(value) ? value.join(", ") : value);
+        }
+      }
+
+      const authResponse = authorizeHttpRequest(
+        new Request(url, { method: req.method, headers }),
+        authToken,
+      );
+      if (authResponse) {
+        await writeNodeResponse(res, authResponse);
+        return;
+      }
+
       const routeResponse = await handleHttpRoute(
         req.method ?? "GET",
         url,
@@ -56,13 +80,6 @@ export async function startHttpServer(config: Config): Promise<void> {
       if (routeResponse) {
         await writeNodeResponse(res, routeResponse);
         return;
-      }
-
-      const headers = new Headers();
-      for (const [key, value] of Object.entries(req.headers)) {
-        if (value !== undefined) {
-          headers.set(key, Array.isArray(value) ? value.join(", ") : value);
-        }
       }
 
       const body =
